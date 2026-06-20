@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -343,6 +344,18 @@ def health_check_folder(root_path, stop_event, emit):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def fmt_duration(secs):
+    """Human-friendly duration: '45s', '3m 20s', '1h 05m'."""
+    secs = int(max(0, secs))
+    if secs < 60:
+        return f"{secs}s"
+    m, s = divmod(secs, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
+
+
 def human_size(n):
     if n is None:
         return "-"
@@ -363,7 +376,7 @@ class FolderCompareApp:
     def __init__(self, root):
         self.root = root
         root.title("Francheese FileCompare - safe read-only folder verification")
-        root.geometry("980x620")
+        root.geometry("1000x680")
         try:
             root.iconbitmap(resource_path("cheese.ico"))
         except Exception:
@@ -380,6 +393,12 @@ class FolderCompareApp:
         self.rows_by_rel = {}  # rel -> treeview item id
         self.results = []       # list of row dicts (for export)
         self.mode = "compare"  # "compare" (two folders) or "health" (one folder)
+        self.running = False
+        self._run_start = 0.0
+        self._phase_total = None   # total for current phase (files or bytes)
+        self._phase_done = 0
+        self._phase_unit = "files"
+        self._phase_start = 0.0
 
         self._build_ui()
         self.root.after(100, self._poll_queue)
@@ -425,9 +444,35 @@ class FolderCompareApp:
         self.export_btn = ttk.Button(btns, text="Export report (CSV)...", command=self._export, state="disabled")
         self.export_btn.pack(side="left", padx=4)
 
-        # Results table
+        # Status + progress area - placed HIGH, right under the buttons, so it
+        # is visible and updates live while a run is in progress.
+        statusbar = ttk.Frame(self.root)
+        statusbar.pack(fill="x", side="top", **pad)
+        self.progress = ttk.Progressbar(statusbar, mode="determinate")
+        self.progress.pack(fill="x", side="top", pady=(0, 2))
+        # ETA + files-done + live issue count, directly under the green bar
+        self.eta_var = tk.StringVar(value="")
+        tk.Label(statusbar, textvariable=self.eta_var, anchor="w",
+                 font=("Segoe UI", 9, "bold"), fg="#444444").pack(fill="x", side="top")
+        self.status_var = tk.StringVar(value="Pick folder(s), then Compare or Health Check. This tool only reads your files - it never changes them.")
+        ttk.Label(statusbar, textvariable=self.status_var, anchor="w").pack(fill="x", side="top")
+
+        # Verdict line + file-count line + summary table
+        self.verdict_label = tk.Label(statusbar, text="", anchor="w", font=("Segoe UI", 11, "bold"))
+        self.verdict_label.pack(fill="x", side="top", pady=(4, 0))
+        self.count_label = tk.Label(statusbar, text="", anchor="w", font=("Segoe UI", 10))
+        self.count_label.pack(fill="x", side="top", pady=(0, 2))
+        self.summary_frame = ttk.Frame(statusbar)
+        self.summary_frame.pack(fill="x", side="top", anchor="w")
+        self.summary_frame.columnconfigure(0, weight=1)
+        self.summary_frame.columnconfigure(1, weight=1)
+        self.summary_frame.columnconfigure(2, weight=1)
+
+        # Results table - fills the remaining space below the status area
+        body = ttk.Frame(self.root)
+        body.pack(fill="both", expand=True, **pad)
         cols = ("status", "integrity", "left_size", "right_size", "rel")
-        self.tree = ttk.Treeview(self.root, columns=cols, show="headings")
+        self.tree = ttk.Treeview(body, columns=cols, show="headings")
         self.tree.heading("status", text="Status")
         self.tree.heading("integrity", text="Integrity")
         self.tree.heading("left_size", text="Left size")
@@ -444,29 +489,10 @@ class FolderCompareApp:
         self.tree.tag_configure(TAG_WARN, foreground="#b54708")     # orange
         self.tree.tag_configure(TAG_NEUTRAL, foreground="#555555")  # grey
 
-        vsb = ttk.Scrollbar(self.root, orient="vertical", command=self.tree.yview)
+        vsb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=4)
-        vsb.pack(side="left", fill="y", pady=4)
-
-        # Bottom status + progress
-        bottom = ttk.Frame(self.root)
-        bottom.pack(fill="x", side="bottom", **pad)
-        self.progress = ttk.Progressbar(bottom, mode="determinate")
-        self.progress.pack(fill="x", side="top", pady=(0, 4))
-        self.status_var = tk.StringVar(value="Pick two folders and click Compare. This tool never modifies your files.")
-        ttk.Label(bottom, textvariable=self.status_var, anchor="w").pack(fill="x", side="top")
-
-        # Verdict line + file-count line + summary table
-        self.verdict_label = tk.Label(bottom, text="", anchor="w", font=("Segoe UI", 11, "bold"))
-        self.verdict_label.pack(fill="x", side="top", pady=(4, 0))
-        self.count_label = tk.Label(bottom, text="", anchor="w", font=("Segoe UI", 10))
-        self.count_label.pack(fill="x", side="top", pady=(0, 2))
-        self.summary_frame = ttk.Frame(bottom)
-        self.summary_frame.pack(fill="x", side="top", anchor="w")
-        self.summary_frame.columnconfigure(0, weight=1)
-        self.summary_frame.columnconfigure(1, weight=1)
-        self.summary_frame.columnconfigure(2, weight=1)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
 
     # -- Folder pickers -----------------------------------------------------
     def _pick_left(self):
@@ -487,11 +513,16 @@ class FolderCompareApp:
         self.results.clear()
         self.verdict_label.config(text="")
         self.count_label.config(text="")
+        self.eta_var.set("Starting...")
         for w in self.summary_frame.winfo_children():
             w.destroy()
         self.progress.configure(mode="indeterminate", value=0)
         self.progress.start(12)
         self.stop_event.clear()
+        self.running = True
+        self._run_start = time.time()
+        self._phase_total = None
+        self._phase_done = 0
         self.compare_btn.configure(state="disabled")
         self.health_btn.configure(state="disabled")
         self.export_btn.configure(state="disabled")
@@ -530,6 +561,22 @@ class FolderCompareApp:
             messagebox.showerror("Invalid folder", "The Left folder path is not a valid folder.")
             return
 
+        proceed = messagebox.askokcancel(
+            "Health Check - what it does",
+            "Health Check will OPEN and read every photo and video in:\n\n"
+            f"{folder}\n\n"
+            "It decodes each file to confirm it is not corrupted - exactly like "
+            "opening it to view. It is strictly READ-ONLY:\n\n"
+            "  • It does NOT modify, move, rename, or delete anything.\n"
+            "  • It only reads your files - they cannot be harmed.\n\n"
+            "Large folders and videos can take a while. You can press Cancel at "
+            "any time; partial results stay on screen.\n\n"
+            "Proceed?",
+            icon="info",
+        )
+        if not proceed:
+            return
+
         self.mode = "health"
         self._begin_run()
         self.worker = threading.Thread(
@@ -551,7 +598,39 @@ class FolderCompareApp:
                 self._handle(kind, payload)
         except queue.Empty:
             pass
+        if self.running:
+            self._refresh_live()
         self.root.after(100, self._poll_queue)
+
+    _BAD_STATUSES = {STATUS_DIFF_CONTENT, STATUS_DIFF_SIZE,
+                     STATUS_MISSING_RIGHT, STATUS_MISSING_LEFT, STATUS_ERROR}
+
+    def _is_problem(self, row):
+        if row.get("integrity") in (INTEGRITY_CORRUPT, INTEGRITY_NO_FFMPEG):
+            return True
+        return row["status"] in self._BAD_STATUSES
+
+    def _refresh_live(self):
+        """Update the live ETA / files-done / issues-so-far line under the bar."""
+        parts = []
+        if self._phase_total:
+            done, total = self._phase_done, self._phase_total
+            elapsed = time.time() - self._phase_start
+            frac = (done / total) if total else 0
+            if done > 0 and frac > 0:
+                parts.append(f"Est. time left: {fmt_duration(elapsed * (1 - frac) / frac)}")
+            else:
+                parts.append("Est. time left: estimating...")
+            if self._phase_unit == "files":
+                parts.append(f"{int(done):,} / {int(total):,} files checked")
+            else:
+                parts.append(f"{human_size(done)} / {human_size(total)} read")
+        else:
+            parts.append("Scanning folders...")
+
+        probs = sum(1 for r in self.results if self._is_problem(r))
+        parts.append("no issues yet" if probs == 0 else f"⚠ {probs} issue(s) found so far")
+        self.eta_var.set("      |      ".join(parts))
 
     def _handle(self, kind, payload):
         if kind == "status":
@@ -563,8 +642,13 @@ class FolderCompareApp:
         elif kind in ("hash_start", "integrity_start"):
             self.progress.stop()
             self.progress.configure(mode="determinate", maximum=max(payload, 1), value=0)
+            self._phase_total = payload
+            self._phase_done = 0
+            self._phase_unit = "bytes" if kind == "hash_start" else "files"
+            self._phase_start = time.time()
         elif kind in ("hash_progress", "integrity_progress"):
             self.progress.configure(value=payload)
+            self._phase_done = payload
         elif kind == "done":
             self._finish(payload)
 
@@ -622,6 +706,7 @@ class FolderCompareApp:
                      font=("Segoe UI", 12, "bold")).pack(side="right", padx=(10, 2))
 
     def _finish(self, outcome):
+        self.running = False
         self.progress.stop()
         self.progress.configure(mode="determinate", value=self.progress["maximum"] if outcome == "complete" else 0)
         self.compare_btn.configure(state="normal")
@@ -634,6 +719,10 @@ class FolderCompareApp:
             self._finish_health(outcome)
         else:
             self._finish_compare(outcome)
+
+        elapsed = fmt_duration(time.time() - self._run_start)
+        self.eta_var.set(f"Completed in {elapsed}  ({len(self.results):,} files)" if outcome == "complete"
+                         else f"Stopped after {elapsed}  ({len(self.results):,} files so far)")
         self.status_var.set("Done." if outcome == "complete" else "Stopped.")
 
     def _finish_compare(self, outcome):
