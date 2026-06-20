@@ -103,37 +103,38 @@ def ffmpeg_path():
 
 
 def check_image_integrity(path):
-    """Try to fully decode an image. Truncated/damaged files raise -> CORRUPT."""
+    """Try to fully decode an image. Only flag CORRUPT when the file is clearly
+    unreadable - never for formats Pillow simply doesn't support."""
     if not _PIL_OK:
         return INTEGRITY_SKIP
+    ext = os.path.splitext(path)[1].lower()
+    if ext in UNSUPPORTED_BY_PIL:
+        return INTEGRITY_SKIP  # e.g. HEIC/HEIF - Pillow can't read it, so we can't judge
     try:
         with Image.open(path) as im:
             im.load()  # force a full decode of the pixel data
         return INTEGRITY_OK
-    except UnidentifiedImageError:
-        # Pillow couldn't identify the format. For a format it normally reads
-        # (e.g. .jpg/.png), that means the header is broken -> CORRUPT. For
-        # formats it can't read anyway (HEIC/HEIF), we can't judge -> SKIP.
-        ext = os.path.splitext(path)[1].lower()
-        return INTEGRITY_SKIP if ext in UNSUPPORTED_BY_PIL else INTEGRITY_CORRUPT
     except Exception:
+        # Pillow couldn't decode it. This is only a reliable "corrupt" signal for
+        # the standard formats Pillow fully supports; anything else we skip rather
+        # than risk a false alarm on a file your photo viewer opens fine.
         return INTEGRITY_CORRUPT
 
 
 def check_video_integrity(path, ffmpeg):
-    """Decode a video with ffmpeg; any decode error means it's damaged."""
+    """Decode a video with ffmpeg. Only flag CORRUPT when ffmpeg actually FAILS
+    (non-zero exit). ffmpeg prints harmless warnings to stderr for many perfectly
+    good files, so stderr content alone is NOT a reliable corruption signal."""
     if not ffmpeg:
         return INTEGRITY_NO_FFMPEG
     try:
         proc = subprocess.run(
-            [ffmpeg, "-v", "error", "-i", path, "-f", "null", "-"],
+            [ffmpeg, "-v", "error", "-xerror", "-i", path, "-f", "null", "-"],
             capture_output=True, text=True, creationflags=_NO_WINDOW,
         )
-        if proc.returncode != 0 or proc.stderr.strip():
-            return INTEGRITY_CORRUPT
-        return INTEGRITY_OK
+        return INTEGRITY_CORRUPT if proc.returncode != 0 else INTEGRITY_OK
     except Exception:
-        return INTEGRITY_CORRUPT
+        return INTEGRITY_SKIP  # couldn't run the check - don't false-flag the file
 
 
 def check_integrity(path, ffmpeg):
