@@ -43,6 +43,15 @@ try:
 except Exception:
     _PIL_OK = False
 
+# pillow-heif teaches Pillow to read Apple HEIC/HEIF photos. If present, we can
+# integrity-check HEIC like any other image instead of skipping it.
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    _HEIC_OK = True
+except Exception:
+    _HEIC_OK = False
+
 
 def resource_path(name):
     """Path to a bundled asset, whether running as a script or a PyInstaller exe."""
@@ -108,8 +117,8 @@ def check_image_integrity(path):
     if not _PIL_OK:
         return INTEGRITY_SKIP
     ext = os.path.splitext(path)[1].lower()
-    if ext in UNSUPPORTED_BY_PIL:
-        return INTEGRITY_SKIP  # e.g. HEIC/HEIF - Pillow can't read it, so we can't judge
+    if ext in UNSUPPORTED_BY_PIL and not _HEIC_OK:
+        return INTEGRITY_SKIP  # HEIC/HEIF without the pillow-heif add-on - can't judge
     try:
         with Image.open(path) as im:
             im.load()  # force a full decode of the pixel data
