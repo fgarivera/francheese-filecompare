@@ -3,6 +3,9 @@ build/
 dist/
 *.spec
 
+# The built app is published as a GitHub Release, not tracked in the repo
+*.exe
+
 # Python
 __pycache__/
 *.pyc
