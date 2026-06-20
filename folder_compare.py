@@ -178,6 +178,7 @@ def fix_mislabeled_files(items, out_dir, stop_event, emit):
     emit(("integrity_start", len(items)))
     ok = 0
     failed = []
+    successes = []  # (original_path, fixed_copy_path) for the optional replace step
     for i, (src, ext) in enumerate(items, 1):
         if stop_event.is_set():
             break
@@ -193,17 +194,55 @@ def fix_mislabeled_files(items, out_dir, stop_event, emit):
             result = check_integrity(dest, ff)    # confirm the copy actually opens
             if result == INTEGRITY_OK:
                 ok += 1
+                successes.append((src, dest))
             else:
                 failed.append((src, f"copy still not openable ({result})"))
         except Exception as exc:
             failed.append((src, str(exc)))
         emit(("integrity_progress", i))
-    emit(("fix_complete", (ok, failed, out_dir)))
+    emit(("fix_complete", (ok, failed, out_dir, successes)))
+
+
+def replace_with_fixed(pairs, backup_dir, stop_event, emit):
+    """Replace each original mislabeled file with its verified fixed copy.
+    SAFETY: the original is MOVED to backup_dir first (never deleted), then the
+    fixed copy is moved into the original's folder."""
+    os.makedirs(backup_dir, exist_ok=True)
+    emit(("integrity_start", len(pairs)))
+    replaced = 0
+    failed = []
+    for i, (src, copy_path) in enumerate(pairs, 1):
+        if stop_event.is_set():
+            break
+        emit(("status", f"Replacing: {os.path.basename(src)}"))
+        try:
+            # 1) back up the original FIRST (move out, never delete)
+            stem, ext0 = os.path.splitext(os.path.basename(src))
+            bdest = os.path.join(backup_dir, stem + ext0)
+            n = 1
+            while os.path.exists(bdest):
+                bdest = os.path.join(backup_dir, f"{stem}_{n}{ext0}")
+                n += 1
+            shutil.move(src, bdest)
+            # 2) move the verified fixed copy into the original's folder
+            cstem, cext = os.path.splitext(os.path.basename(copy_path))
+            in_place = os.path.join(os.path.dirname(src), cstem + cext)
+            n = 1
+            while os.path.exists(in_place):
+                in_place = os.path.join(os.path.dirname(src), f"{cstem}_{n}{cext}")
+                n += 1
+            shutil.move(copy_path, in_place)
+            replaced += 1
+        except Exception as exc:
+            failed.append((src, str(exc)))
+        emit(("integrity_progress", i))
+    emit(("replace_complete", (replaced, failed, backup_dir)))
 
 INTEGRITY_OK = "OK"
 INTEGRITY_CORRUPT = "CORRUPT"
 INTEGRITY_SKIP = "-"                 # not a photo/video, or format we can't assess
 INTEGRITY_NO_FFMPEG = "needs ffmpeg" # a video, but ffmpeg isn't available to check it
+INTEGRITY_MISLABELED = "MISLABELED"  # content is fine but the file extension is wrong
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # keep console from flashing
 
@@ -273,6 +312,16 @@ def check_integrity(path, ffmpeg):
     if kind == "video":
         return check_video_integrity(path, ffmpeg)
     return INTEGRITY_SKIP  # documents, archives, etc. - nothing to decode
+
+
+def assess_file(path, ffmpeg):
+    """Return (integrity_result, correct_extension). A mislabeled file (valid
+    content, wrong extension) is reported as MISLABELED so it's clearly visible,
+    with the correct extension it should have."""
+    fix_ext = fixable_target(path)
+    if fix_ext:
+        return INTEGRITY_MISLABELED, fix_ext
+    return check_integrity(path, ffmpeg), ""
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +464,7 @@ def compare_folders(left_root, right_root, do_hash, do_integrity, stop_event, em
                 return
             target = row.get("right_full") or row.get("left_full")  # check the kept copy
             emit(("status", f"Checking integrity: {row['rel']}"))
-            row["integrity"] = check_integrity(target, ffmpeg)
+            row["integrity"], row["fix_ext"] = assess_file(target, ffmpeg)
             emit(("update", row))
             emit(("integrity_progress", i))
 
@@ -432,6 +481,7 @@ def _row(rel, status, left_size, right_size, l, r):
         "right_full": r["full"] if r else None,
         "note": "",
         "integrity": "",  # filled by the integrity pass: OK / CORRUPT / etc.
+        "fix_ext": "",     # for mislabeled files: the correct extension
     }
 
 
@@ -463,7 +513,7 @@ def health_check_folder(root_path, stop_event, emit):
             emit(("done", "cancelled"))
             return
         emit(("status", f"Checking: {row['rel']}"))
-        row["integrity"] = check_integrity(row["left_full"], ffmpeg)
+        row["integrity"], row["fix_ext"] = assess_file(row["left_full"], ffmpeg)
         emit(("update", row))
         emit(("integrity_progress", i))
 
@@ -739,8 +789,16 @@ class FolderCompareApp:
         out_dir = filedialog.askdirectory(title="Choose a folder for the fixed, openable copies")
         if not out_dir:
             return
+        self._set_busy("Making fixed copies...")
+        self.worker = threading.Thread(
+            target=fix_mislabeled_files,
+            args=(list(self.fixable), out_dir, self.stop_event, self.queue.put),
+            daemon=True,
+        )
+        self.worker.start()
 
-        # Busy state - but keep the existing results visible on screen
+    def _set_busy(self, status_msg):
+        """Switch into running state without clearing the visible results."""
         self.compare_btn.configure(state="disabled")
         self.health_btn.configure(state="disabled")
         self.fix_btn.configure(state="disabled")
@@ -752,16 +810,9 @@ class FolderCompareApp:
         self.running = True
         self._run_start = time.time()
         self._phase_total = None
-        self.status_var.set("Making fixed copies...")
-        self.worker = threading.Thread(
-            target=fix_mislabeled_files,
-            args=(list(self.fixable), out_dir, self.stop_event, self.queue.put),
-            daemon=True,
-        )
-        self.worker.start()
+        self.status_var.set(status_msg)
 
-    def _finish_fix(self, payload):
-        ok, failed, out_dir = payload
+    def _set_idle(self):
         self.running = False
         self.progress.stop()
         self.progress.configure(mode="determinate", value=self.progress["maximum"])
@@ -772,6 +823,9 @@ class FolderCompareApp:
         if self.results:
             self.export_btn.configure(state="normal")
 
+    def _finish_fix(self, payload):
+        ok, failed, out_dir, successes = payload
+        self._set_idle()
         msg = (f"Fixed {ok} file(s).\n\nOpenable copies saved to:\n{out_dir}\n\n"
                "Your original files were NOT changed.")
         if failed:
@@ -782,6 +836,41 @@ class FolderCompareApp:
         messagebox.showinfo("Fix complete", msg)
         self.status_var.set(f"Fixed {ok} file(s) into {out_dir}. Originals untouched.")
         self.eta_var.set(f"Fix complete - {ok} fixed, {len(failed)} skipped.")
+
+        # Optional step 2: replace the originals with the verified fixed versions.
+        if successes and messagebox.askyesno(
+            "Replace originals with fixed versions?",
+            f"Also replace the {len(successes)} original mislabeled file(s) with the "
+            "fixed versions?\n\n"
+            "• Each fixed file is placed where its original is.\n"
+            "• Each original is MOVED to a backup folder (nothing is deleted).\n"
+            f"• Backup location: {os.path.join(out_dir, '_mislabeled_originals_backup')}\n\n"
+            "You can delete that backup folder yourself later, once you've confirmed "
+            "everything opens.\n\nProceed?"):
+            backup_dir = os.path.join(out_dir, "_mislabeled_originals_backup")
+            self._set_busy("Replacing originals (backing them up first)...")
+            self.worker = threading.Thread(
+                target=replace_with_fixed,
+                args=(successes, backup_dir, self.stop_event, self.queue.put),
+                daemon=True,
+            )
+            self.worker.start()
+
+    def _finish_replace(self, payload):
+        replaced, failed, backup_dir = payload
+        self._set_idle()
+        msg = (f"Replaced {replaced} file(s) with the fixed versions.\n\n"
+               f"The old originals were moved to:\n{backup_dir}\n\n"
+               "Once you've confirmed everything opens, you can delete that backup "
+               "folder to free up space. (Re-run a check to refresh the list.)")
+        if failed:
+            msg += f"\n\n{len(failed)} could not be replaced:\n" + "\n".join(
+                f"  - {os.path.basename(s)}: {r}" for s, r in failed[:8])
+        messagebox.showinfo("Replace complete", msg)
+        self.status_var.set(f"Replaced {replaced} file(s). Originals backed up to {backup_dir}.")
+        self.eta_var.set(f"Replace complete - {replaced} replaced, {len(failed)} skipped.")
+        self.fixable = []
+        self.fix_btn.configure(state="disabled")
 
     def _cancel(self):
         self.stop_event.set()
@@ -850,6 +939,8 @@ class FolderCompareApp:
             self._finish(payload)
         elif kind == "fix_complete":
             self._finish_fix(payload)
+        elif kind == "replace_complete":
+            self._finish_replace(payload)
 
     def _tag_for(self, status):
         if status == STATUS_IDENTICAL:
@@ -865,13 +956,15 @@ class FolderCompareApp:
         integ = row.get("integrity", "")
         if integ == INTEGRITY_CORRUPT:
             return TAG_BAD
-        if integ == INTEGRITY_NO_FFMPEG:
+        if integ in (INTEGRITY_NO_FFMPEG, INTEGRITY_MISLABELED):
             return TAG_WARN
         return self._tag_for(row["status"])
 
     @staticmethod
     def _integrity_text(row):
         v = row.get("integrity", "")
+        if v == INTEGRITY_MISLABELED:
+            return f"MISLABELED -> {row.get('fix_ext', '')}"
         return "" if v in ("", INTEGRITY_SKIP) else v
 
     def _row_values(self, row):
@@ -920,14 +1013,9 @@ class FolderCompareApp:
             self._finish_compare(outcome)
 
         # Find mislabeled files (e.g. a video named .HEIC) that we can offer to fix.
-        self.fixable = []
-        for r in self.results:
-            p = r.get("left_full") or r.get("right_full")
-            if not p:
-                continue
-            tgt = fixable_target(p)
-            if tgt:
-                self.fixable.append((p, tgt))
+        self.fixable = [(r.get("left_full") or r.get("right_full"), r["fix_ext"])
+                        for r in self.results
+                        if r.get("integrity") == INTEGRITY_MISLABELED and r.get("fix_ext")]
         self.fix_btn.configure(state="normal" if self.fixable else "disabled")
         if self.fixable:
             self.status_var.set(
@@ -955,7 +1043,7 @@ class FolderCompareApp:
         miss_l = counts.get(STATUS_MISSING_LEFT, 0)
         errs = counts.get(STATUS_ERROR, 0)
         corrupt = sum(1 for row in self.results if row.get("integrity") == INTEGRITY_CORRUPT)
-        unchecked = sum(1 for row in self.results if row.get("integrity") == INTEGRITY_NO_FFMPEG)
+        mislabeled = sum(1 for row in self.results if row.get("integrity") == INTEGRITY_MISLABELED)
 
         problems = diff + miss_r + miss_l + errs + corrupt
         total = len(self.results)
@@ -980,8 +1068,8 @@ class FolderCompareApp:
             ("Missing on RIGHT", miss_r, TAG_WARN if miss_r else TAG_NEUTRAL),
             ("Missing on LEFT", miss_l, TAG_WARN if miss_l else TAG_NEUTRAL),
             ("Errors (unreadable)", errs, TAG_BAD if errs else TAG_NEUTRAL),
+            ("Mislabeled (fixable)", mislabeled, TAG_WARN if mislabeled else TAG_NEUTRAL),
             ("Size-only (not hashed)", quick, TAG_NEUTRAL),
-            ("Videos not checked", unchecked, TAG_WARN if unchecked else TAG_NEUTRAL),
         ])
 
         if outcome == "cancelled":
@@ -997,6 +1085,7 @@ class FolderCompareApp:
         ok = sum(1 for r in self.results if r.get("integrity") == INTEGRITY_OK)
         corrupt = sum(1 for r in self.results if r.get("integrity") == INTEGRITY_CORRUPT)
         unchecked = sum(1 for r in self.results if r.get("integrity") == INTEGRITY_NO_FFMPEG)
+        mislabeled = sum(1 for r in self.results if r.get("integrity") == INTEGRITY_MISLABELED)
         skipped = sum(1 for r in self.results if r.get("integrity") in ("", INTEGRITY_SKIP)
                       and r["status"] != STATUS_ERROR)
         errs = sum(1 for r in self.results if r["status"] == STATUS_ERROR)
@@ -1010,6 +1099,7 @@ class FolderCompareApp:
             ("Healthy (opens fine)", ok, TAG_OK),
             ("Corrupt (won't open)", corrupt, TAG_BAD if corrupt else TAG_NEUTRAL),
             ("Unreadable (errors)", errs, TAG_BAD if errs else TAG_NEUTRAL),
+            ("Mislabeled (fixable)", mislabeled, TAG_WARN if mislabeled else TAG_NEUTRAL),
             ("Videos not checked", unchecked, TAG_WARN if unchecked else TAG_NEUTRAL),
             ("Skipped (not photo/video)", skipped, TAG_NEUTRAL),
         ])
