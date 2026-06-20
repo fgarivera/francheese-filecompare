@@ -24,6 +24,7 @@ USAGE
 
 import csv
 import hashlib
+import json
 import os
 import queue
 import shutil
@@ -191,7 +192,7 @@ def fix_mislabeled_files(items, out_dir, stop_event, emit):
                 dest = os.path.join(out_dir, f"{stem}_{n}{ext}")
                 n += 1
             shutil.copy2(src, dest)               # read original, write new copy only
-            result = check_integrity(dest, ff)    # confirm the copy actually opens
+            result, _ = check_integrity(dest, ff)  # confirm the copy actually opens
             if result == INTEGRITY_OK:
                 ok += 1
                 successes.append((src, dest))
@@ -263,43 +264,49 @@ def ffmpeg_path():
 
 
 def check_image_integrity(path):
-    """Try to fully decode an image. Only flag CORRUPT when the file is clearly
-    unreadable - never for formats Pillow simply doesn't support."""
+    """Try to fully decode an image. Returns (result, reason)."""
     if not _PIL_OK:
-        return INTEGRITY_SKIP
+        return INTEGRITY_SKIP, ""
     ext = os.path.splitext(path)[1].lower()
     if ext in UNSUPPORTED_BY_PIL and not _HEIC_OK:
-        return INTEGRITY_SKIP  # HEIC/HEIF without the pillow-heif add-on - can't judge
+        return INTEGRITY_SKIP, "format not supported by checker"
     try:
         with Image.open(path) as im:
             im.load()  # force a full decode of the pixel data
-        return INTEGRITY_OK
-    except Exception:
-        # Pillow couldn't decode it. This is only a reliable "corrupt" signal for
-        # the standard formats Pillow fully supports; anything else we skip rather
-        # than risk a false alarm on a file your photo viewer opens fine.
-        return INTEGRITY_CORRUPT
+        return INTEGRITY_OK, ""
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "cannot identify image" in msg:
+            reason = "not a recognizable image (header damaged or unsupported format)"
+        elif "truncated" in msg or "premature" in msg:
+            reason = "image is truncated (cut off / incomplete data)"
+        elif "broken data" in msg:
+            reason = "broken image data stream"
+        else:
+            reason = (str(exc) or type(exc).__name__)[:120]
+        return INTEGRITY_CORRUPT, reason
 
 
 def check_video_integrity(path, ffmpeg):
-    """Decode a video with ffmpeg. Only flag CORRUPT when ffmpeg actually FAILS
-    (non-zero exit). ffmpeg prints harmless warnings to stderr for many perfectly
-    good files, so stderr content alone is NOT a reliable corruption signal."""
+    """Decode a video with ffmpeg. Only flag CORRUPT on a real failure (non-zero
+    exit). Returns (result, reason)."""
     if not ffmpeg:
-        return INTEGRITY_NO_FFMPEG
+        return INTEGRITY_NO_FFMPEG, ""
     try:
         proc = subprocess.run(
             [ffmpeg, "-v", "error", "-xerror", "-i", path, "-f", "null", "-"],
             capture_output=True, text=True, creationflags=_NO_WINDOW,
         )
-        return INTEGRITY_CORRUPT if proc.returncode != 0 else INTEGRITY_OK
-    except Exception:
-        return INTEGRITY_SKIP  # couldn't run the check - don't false-flag the file
+        if proc.returncode != 0:
+            lines = [ln for ln in proc.stderr.strip().splitlines() if ln.strip()]
+            return INTEGRITY_CORRUPT, (lines[-1] if lines else "ffmpeg could not decode the video")[:200]
+        return INTEGRITY_OK, ""
+    except Exception as exc:
+        return INTEGRITY_SKIP, str(exc)[:200]  # couldn't run the check - don't false-flag
 
 
 def check_integrity(path, ffmpeg):
-    # Trust the file's actual content over its extension - iPhone files are
-    # sometimes mislabeled (e.g. a video named .HEIC).
+    """Return (result, reason), trusting the file's real content over its extension."""
     kind = sniff_kind(path)
     if kind is None:
         ext = os.path.splitext(path)[1].lower()
@@ -311,17 +318,26 @@ def check_integrity(path, ffmpeg):
         return check_image_integrity(path)
     if kind == "video":
         return check_video_integrity(path, ffmpeg)
-    return INTEGRITY_SKIP  # documents, archives, etc. - nothing to decode
+    return INTEGRITY_SKIP, ""  # documents, archives, etc. - nothing to decode
+
+
+def corruption_outlook(reason):
+    """A short, honest assessment of whether a corrupt file might be recovered."""
+    r = (reason or "").lower()
+    if "truncat" in r or "premature" in r:
+        return "maybe partially salvageable"
+    return "likely not recoverable"
 
 
 def assess_file(path, ffmpeg):
-    """Return (integrity_result, correct_extension). A mislabeled file (valid
-    content, wrong extension) is reported as MISLABELED so it's clearly visible,
-    with the correct extension it should have."""
+    """Return (integrity_result, correct_extension, reason)."""
     fix_ext = fixable_target(path)
     if fix_ext:
-        return INTEGRITY_MISLABELED, fix_ext
-    return check_integrity(path, ffmpeg), ""
+        kind = sniff_kind(path)
+        cur = os.path.splitext(path)[1].lower() or "(none)"
+        return INTEGRITY_MISLABELED, fix_ext, f"named {cur} but content is a {kind}"
+    result, reason = check_integrity(path, ffmpeg)
+    return result, "", reason
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +480,7 @@ def compare_folders(left_root, right_root, do_hash, do_integrity, stop_event, em
                 return
             target = row.get("right_full") or row.get("left_full")  # check the kept copy
             emit(("status", f"Checking integrity: {row['rel']}"))
-            row["integrity"], row["fix_ext"] = assess_file(target, ffmpeg)
+            row["integrity"], row["fix_ext"], row["reason"] = assess_file(target, ffmpeg)
             emit(("update", row))
             emit(("integrity_progress", i))
 
@@ -482,6 +498,7 @@ def _row(rel, status, left_size, right_size, l, r):
         "note": "",
         "integrity": "",  # filled by the integrity pass: OK / CORRUPT / etc.
         "fix_ext": "",     # for mislabeled files: the correct extension
+        "reason": "",      # for corrupt files: short reason why
     }
 
 
@@ -513,11 +530,78 @@ def health_check_folder(root_path, stop_event, emit):
             emit(("done", "cancelled"))
             return
         emit(("status", f"Checking: {row['rel']}"))
-        row["integrity"], row["fix_ext"] = assess_file(row["left_full"], ffmpeg)
+        row["integrity"], row["fix_ext"], row["reason"] = assess_file(row["left_full"], ffmpeg)
         emit(("update", row))
         emit(("integrity_progress", i))
 
     emit(("done", "complete"))
+
+
+# ---------------------------------------------------------------------------
+# Persistent audit history (so the app remembers what it checked and fixed)
+# ---------------------------------------------------------------------------
+
+def app_data_dir():
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    d = os.path.join(base, "FrancheeseFileCompare")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def history_path():
+    return os.path.join(app_data_dir(), "history.json")
+
+
+def load_history():
+    try:
+        with open(history_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def append_history(record):
+    """Append a record. Keeps only the most recent fingerprint per folder (they
+    can be large) and bounds total history size."""
+    recs = load_history()
+    key = record.get("_fpkey")
+    if key:
+        for r in recs:  # drop heavy fingerprints from older runs of the same folder
+            if r.get("_fpkey") == key:
+                r.pop("fingerprint", None)
+    recs.append(record)
+    try:
+        with open(history_path(), "w", encoding="utf-8") as f:
+            json.dump(recs[-300:], f, indent=2)
+    except OSError:
+        pass
+
+
+def folder_fingerprint(path):
+    """Quick read-only snapshot of a folder: {relative_path: size}. Metadata
+    only (no file contents read), so it's fast even for large folders."""
+    fp = {}
+    for dirpath, _dirs, names in os.walk(path):
+        for n in names:
+            full = os.path.join(dirpath, n)
+            try:
+                fp[os.path.relpath(full, path)] = os.path.getsize(full)
+            except OSError:
+                fp[os.path.relpath(full, path)] = -1
+    return fp
+
+
+def compare_fingerprint(old, new):
+    old = old or {}
+    new = new or {}
+    added = [k for k in new if k not in old]
+    changed = [k for k in new if k in old and old[k] != new[k]]
+    removed = [k for k in old if k not in new]
+    return added, changed, removed
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +657,8 @@ class FolderCompareApp:
         self.rows_by_rel = {}  # rel -> treeview item id
         self.results = []       # list of row dicts (for export)
         self.fixable = []       # [(path, correct_ext)] mislabeled files we can fix
+        self.corrupt_files = [] # row dicts that are genuinely corrupt
+        self._pending_fingerprint = None  # folder snapshot for the audit log
         self.mode = "compare"  # "compare" (two folders) or "health" (one folder)
         self.running = False
         self._run_start = 0.0
@@ -620,11 +706,18 @@ class FolderCompareApp:
         self.compare_btn.pack(side="left")
         self.health_btn = ttk.Button(btns, text="Health Check (Left folder only)", command=self._start_health)
         self.health_btn.pack(side="left", padx=4)
-        self.fix_btn = ttk.Button(btns, text="Fix mislabeled files...", command=self._fix_mislabeled, state="disabled")
-        self.fix_btn.pack(side="left", padx=4)
         self.cancel_btn = ttk.Button(btns, text="Cancel", command=self._cancel, state="disabled")
         self.cancel_btn.pack(side="left", padx=4)
-        self.export_btn = ttk.Button(btns, text="Export report (CSV)...", command=self._export, state="disabled")
+
+        btns2 = ttk.Frame(self.root)
+        btns2.pack(fill="x", padx=6)
+        self.mislabel_btn = ttk.Button(btns2, text="Mislabeled files...", command=self._show_mislabeled_window, state="disabled")
+        self.mislabel_btn.pack(side="left")
+        self.corrupt_btn = ttk.Button(btns2, text="Corrupted files...", command=self._show_corrupt_window, state="disabled")
+        self.corrupt_btn.pack(side="left", padx=4)
+        self.history_btn = ttk.Button(btns2, text="History...", command=self._show_history_window)
+        self.history_btn.pack(side="left", padx=4)
+        self.export_btn = ttk.Button(btns2, text="Export report (CSV)...", command=self._export, state="disabled")
         self.export_btn.pack(side="left", padx=4)
 
         # Status + progress area - placed HIGH, right under the buttons, so it
@@ -707,9 +800,11 @@ class FolderCompareApp:
         self._phase_total = None
         self._phase_done = 0
         self.fixable = []
+        self.corrupt_files = []
         self.compare_btn.configure(state="disabled")
         self.health_btn.configure(state="disabled")
-        self.fix_btn.configure(state="disabled")
+        self.mislabel_btn.configure(state="disabled")
+        self.corrupt_btn.configure(state="disabled")
         self.export_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
 
@@ -727,6 +822,7 @@ class FolderCompareApp:
             return
 
         self.mode = "compare"
+        self._pending_fingerprint = None
         self._begin_run()
         do_hash = self.hash_var.get()
         do_integrity = self.integrity_var.get()
@@ -746,23 +842,51 @@ class FolderCompareApp:
             messagebox.showerror("Invalid folder", "The Left folder path is not a valid folder.")
             return
 
-        proceed = messagebox.askokcancel(
-            "Health Check - what it does",
-            "Health Check will OPEN and read every photo and video in:\n\n"
-            f"{folder}\n\n"
-            "It decodes each file to confirm it is not corrupted - exactly like "
-            "opening it to view. It is strictly READ-ONLY:\n\n"
-            "  • It does NOT modify, move, rename, or delete anything.\n"
-            "  • It only reads your files - they cannot be harmed.\n\n"
-            "Large folders and videos can take a while. You can press Cancel at "
-            "any time; partial results stay on screen.\n\n"
-            "Proceed?",
-            icon="info",
-        )
-        if not proceed:
-            return
+        # Quick read-only snapshot for the audit log + "already checked" reminder.
+        fp = folder_fingerprint(folder)
+        last = self._last_check_record(folder)
+        if last:
+            added, changed, removed = compare_fingerprint(last.get("fingerprint"), fp)
+            when = last.get("timestamp", "a previous date")
+            summ = last.get("summary", "")
+            if not (added or changed or removed):
+                proceed = messagebox.askyesno(
+                    "You already checked this folder",
+                    f"✓ You already checked this folder on {when}, and NOTHING has changed "
+                    f"since (same {len(fp)} files).\n\n"
+                    f"Last result: {summ}\n\n"
+                    "Your files here are already accounted for - you don't need to re-check "
+                    "unless you want to.\n\nCheck again anyway?")
+            else:
+                proceed = messagebox.askyesno(
+                    "Checked before - but some files changed",
+                    f"You checked this folder on {when}, but since then:\n"
+                    f"   • {len(added)} new file(s)\n"
+                    f"   • {len(changed)} changed\n"
+                    f"   • {len(removed)} removed\n\n"
+                    f"Last result: {summ}\n\nRecommended: check again. Proceed?")
+            if not proceed:
+                self.status_var.set(f"Skipped - already checked on {when} ({summ}).")
+                return
+        else:
+            proceed = messagebox.askokcancel(
+                "Health Check - what it does",
+                "Health Check will OPEN and read every photo and video in:\n\n"
+                f"{folder}\n\n"
+                "It decodes each file to confirm it is not corrupted - exactly like "
+                "opening it to view. It is strictly READ-ONLY:\n\n"
+                "  • It does NOT modify, move, rename, or delete anything.\n"
+                "  • It only reads your files - they cannot be harmed.\n\n"
+                "Large folders and videos can take a while. You can press Cancel at "
+                "any time; partial results stay on screen.\n\n"
+                "Proceed?",
+                icon="info",
+            )
+            if not proceed:
+                return
 
         self.mode = "health"
+        self._pending_fingerprint = fp
         self._begin_run()
         self.worker = threading.Thread(
             target=health_check_folder,
@@ -801,7 +925,8 @@ class FolderCompareApp:
         """Switch into running state without clearing the visible results."""
         self.compare_btn.configure(state="disabled")
         self.health_btn.configure(state="disabled")
-        self.fix_btn.configure(state="disabled")
+        self.mislabel_btn.configure(state="disabled")
+        self.corrupt_btn.configure(state="disabled")
         self.export_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.progress.configure(mode="indeterminate", value=0)
@@ -812,16 +937,19 @@ class FolderCompareApp:
         self._phase_total = None
         self.status_var.set(status_msg)
 
+    def _update_result_buttons(self):
+        self.mislabel_btn.configure(state="normal" if self.fixable else "disabled")
+        self.corrupt_btn.configure(state="normal" if self.corrupt_files else "disabled")
+        self.export_btn.configure(state="normal" if self.results else "disabled")
+
     def _set_idle(self):
         self.running = False
         self.progress.stop()
         self.progress.configure(mode="determinate", value=self.progress["maximum"])
         self.compare_btn.configure(state="normal")
         self.health_btn.configure(state="normal")
-        self.fix_btn.configure(state="normal" if self.fixable else "disabled")
         self.cancel_btn.configure(state="disabled")
-        if self.results:
-            self.export_btn.configure(state="normal")
+        self._update_result_buttons()
 
     def _finish_fix(self, payload):
         ok, failed, out_dir, successes = payload
@@ -836,6 +964,7 @@ class FolderCompareApp:
         messagebox.showinfo("Fix complete", msg)
         self.status_var.set(f"Fixed {ok} file(s) into {out_dir}. Originals untouched.")
         self.eta_var.set(f"Fix complete - {ok} fixed, {len(failed)} skipped.")
+        self._log_fix("fix", ok, out_dir)
 
         # Optional step 2: replace the originals with the verified fixed versions.
         if successes and messagebox.askyesno(
@@ -870,7 +999,133 @@ class FolderCompareApp:
         self.status_var.set(f"Replaced {replaced} file(s). Originals backed up to {backup_dir}.")
         self.eta_var.set(f"Replace complete - {replaced} replaced, {len(failed)} skipped.")
         self.fixable = []
-        self.fix_btn.configure(state="disabled")
+        self._log_fix("replace", replaced, backup_dir)
+        self._update_result_buttons()
+
+    # -- Audit log ----------------------------------------------------------
+    def _folders(self):
+        if self.mode == "compare":
+            return [self.left_var.get().strip(), self.right_var.get().strip()]
+        return [self.left_var.get().strip()]
+
+    def _last_check_record(self, folder):
+        key = os.path.normcase(os.path.abspath(folder))
+        for rec in reversed(load_history()):
+            if rec.get("action") != "check":
+                continue
+            for f in rec.get("folders", []):
+                if f and os.path.normcase(os.path.abspath(f)) == key:
+                    return rec
+        return None
+
+    def _log_run(self):
+        mis = [{"rel": r["rel"], "path": r.get("left_full") or r.get("right_full"), "fix_ext": r.get("fix_ext", "")}
+               for r in self.results if r.get("integrity") == INTEGRITY_MISLABELED]
+        cor = [{"rel": r["rel"], "path": r.get("left_full") or r.get("right_full"),
+                "reason": r.get("reason", ""), "outlook": corruption_outlook(r.get("reason"))}
+               for r in self.results if r.get("integrity") == INTEGRITY_CORRUPT]
+        summary = (f"{len(self.results)} files - {len(cor)} corrupt, {len(mis)} mislabeled"
+                   if (cor or mis) else f"{len(self.results)} files - all good")
+        folders = self._folders()
+        record = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M"),
+            "action": "check",
+            "mode": self.mode,
+            "folders": folders,
+            "total": len(self.results),
+            "summary": summary,
+            "mislabeled": mis,
+            "corrupt": cor,
+        }
+        if self._pending_fingerprint is not None and folders:
+            record["fingerprint"] = self._pending_fingerprint
+            record["_fpkey"] = os.path.normcase(os.path.abspath(folders[0]))
+        append_history(record)
+
+    def _log_fix(self, action, count, location):
+        append_history({
+            "timestamp": time.strftime("%Y-%m-%d %H:%M"),
+            "action": action,  # "fix" or "replace"
+            "mode": self.mode,
+            "folders": self._folders(),
+            "total": count,
+            "summary": (f"Made {count} fixed copies in {location}" if action == "fix"
+                        else f"Replaced {count} files; originals backed up to {location}"),
+            "mislabeled": [],
+            "corrupt": [],
+        })
+
+    # -- Detail / summary windows ------------------------------------------
+    def _make_list_window(self, title, columns, rows, footer_builder=None):
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("760x420")
+        try:
+            win.iconbitmap(resource_path("cheese.ico"))
+        except Exception:
+            pass
+        tree = ttk.Treeview(win, columns=[c[0] for c in columns], show="headings")
+        for cid, label, width in columns:
+            tree.heading(cid, text=label)
+            tree.column(cid, width=width, anchor="w")
+        for values in rows:
+            tree.insert("", "end", values=values)
+        vsb = ttk.Scrollbar(win, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="top", fill="both", expand=True, padx=6, pady=6)
+        vsb.place(in_=tree, relx=1.0, rely=0, relheight=1.0, anchor="ne")
+        footer = ttk.Frame(win)
+        footer.pack(fill="x", padx=6, pady=(0, 8))
+        if footer_builder:
+            footer_builder(footer, win)
+        ttk.Button(footer, text="Close", command=win.destroy).pack(side="right")
+        return win
+
+    def _show_mislabeled_window(self):
+        rows = [(r["rel"],
+                 os.path.splitext(r["rel"])[1] or "(none)",
+                 r.get("fix_ext", ""),
+                 "needs fixing")
+                for r in self.results if r.get("integrity") == INTEGRITY_MISLABELED]
+        cols = [("file", "File", 360), ("cur", "Current ext", 110),
+                ("correct", "Correct ext", 110), ("status", "Status", 150)]
+
+        def footer(frame, win):
+            ttk.Label(frame, text=f"{len(rows)} mislabeled file(s) - their content is fine, only the name is wrong.").pack(side="left")
+            if self.fixable:
+                def do_fix():
+                    win.destroy()
+                    self._fix_mislabeled()
+                ttk.Button(frame, text="Fix these files (make openable copies)...", command=do_fix).pack(side="left", padx=10)
+
+        self._make_list_window("Mislabeled files", cols, rows, footer)
+
+    def _show_corrupt_window(self):
+        rows = [(r["rel"], r.get("reason", "unknown"), corruption_outlook(r.get("reason")))
+                for r in self.corrupt_files]
+        cols = [("file", "File", 320), ("reason", "Why it's flagged", 280),
+                ("outlook", "Recoverable?", 150)]
+
+        def footer(frame, win):
+            ttk.Label(frame, text=f"{len(rows)} file(s) could not be opened. 'Recoverable?' is a best-effort guess.").pack(side="left")
+
+        self._make_list_window("Corrupted files", cols, rows, footer)
+
+    def _show_history_window(self):
+        recs = list(reversed(load_history()))
+        cols = [("when", "When", 130), ("action", "Action", 80),
+                ("folder", "Folder", 360), ("summary", "Result", 320)]
+        rows = [(r.get("timestamp", "?"), r.get("action", "?"),
+                 (r.get("folders") or [""])[0], r.get("summary", ""))
+                for r in recs]
+
+        def footer(frame, win):
+            ttk.Label(frame, text=f"{len(rows)} past run(s). History is saved at: {history_path()}").pack(side="left")
+
+        if not rows:
+            messagebox.showinfo("History", "No history yet. Run a Health Check or Compare and it will be recorded here.")
+            return
+        self._make_list_window("History - past checks and fixes", cols, rows, footer)
 
     def _cancel(self):
         self.stop_event.set()
@@ -1016,11 +1271,14 @@ class FolderCompareApp:
         self.fixable = [(r.get("left_full") or r.get("right_full"), r["fix_ext"])
                         for r in self.results
                         if r.get("integrity") == INTEGRITY_MISLABELED and r.get("fix_ext")]
-        self.fix_btn.configure(state="normal" if self.fixable else "disabled")
+        self.corrupt_files = [r for r in self.results if r.get("integrity") == INTEGRITY_CORRUPT]
+        self._update_result_buttons()
         if self.fixable:
             self.status_var.set(
-                f"Note: {len(self.fixable)} file(s) are mislabeled (wrong extension) - "
-                f"click 'Fix mislabeled files...' to make safe, openable copies.")
+                f"Note: {len(self.fixable)} file(s) are mislabeled - open 'Mislabeled files...' to review and fix.")
+
+        if outcome == "complete":
+            self._log_run()
 
         elapsed = fmt_duration(time.time() - self._run_start)
         self.eta_var.set(f"Completed in {elapsed}  ({len(self.results):,} files)" if outcome == "complete"
@@ -1129,10 +1387,12 @@ class FolderCompareApp:
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                w.writerow(["Status", "Integrity", "Note", "Left size (bytes)", "Right size (bytes)", "Relative path", "Left path", "Right path"])
+                w.writerow(["Status", "Integrity", "Correct ext", "Reason", "Note",
+                            "Left size (bytes)", "Right size (bytes)", "Relative path", "Left path", "Right path"])
                 for row in self.results:
                     w.writerow([
-                        row["status"], row.get("integrity", ""), row.get("note", ""),
+                        row["status"], row.get("integrity", ""), row.get("fix_ext", ""),
+                        row.get("reason", ""), row.get("note", ""),
                         row["left_size"] if row["left_size"] is not None else "",
                         row["right_size"] if row["right_size"] is not None else "",
                         row["rel"], row["left_full"] or "", row["right_full"] or "",
