@@ -88,6 +88,39 @@ VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".m4v", ".mpg", ".mpeg", "
 # rather than false-flag. (HEIC/HEIF from iPhones fall here.)
 UNSUPPORTED_BY_PIL = {".heic", ".heif"}
 
+# Real-content signatures. iPhone files sometimes carry the wrong extension
+# (e.g. a video saved as .HEIC), so we sniff the actual bytes, not the name.
+_HEIF_BRANDS = {b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1", b"avif"}
+_VIDEO_BRANDS = {b"mp41", b"mp42", b"isom", b"iso2", b"iso4", b"iso5", b"iso6",
+                 b"m4v ", b"mmp4", b"dash", b"qt  ", b"3gp4", b"3gp5", b"3g2a", b"M4V "}
+
+
+def sniff_kind(path):
+    """Return 'image', 'video', or None based on the file's actual content."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+    except OSError:
+        return None
+    if len(head) < 12:
+        return None
+    if (head[:3] == b"\xff\xd8\xff" or head[:8] == b"\x89PNG\r\n\x1a\n"
+            or head[:4] == b"GIF8" or head[:2] == b"BM"
+            or head[:4] in (b"II*\x00", b"MM\x00*")):
+        return "image"
+    if head[:4] == b"RIFF":
+        return "image" if head[8:12] == b"WEBP" else ("video" if head[8:12] == b"AVI " else None)
+    if head[4:8] == b"ftyp":  # ISO base media (HEIC, MP4, MOV, ...)
+        brand = head[8:12]
+        if brand in _HEIF_BRANDS:
+            return "image"
+        if brand in _VIDEO_BRANDS:
+            return "video"
+        if any(b in head for b in _HEIF_BRANDS):
+            return "image"
+        return "video"  # an ISO-media file that isn't HEIF is almost certainly video
+    return None
+
 INTEGRITY_OK = "OK"
 INTEGRITY_CORRUPT = "CORRUPT"
 INTEGRITY_SKIP = "-"                 # not a photo/video, or format we can't assess
@@ -147,10 +180,18 @@ def check_video_integrity(path, ffmpeg):
 
 
 def check_integrity(path, ffmpeg):
-    ext = os.path.splitext(path)[1].lower()
-    if ext in IMAGE_EXTS:
+    # Trust the file's actual content over its extension - iPhone files are
+    # sometimes mislabeled (e.g. a video named .HEIC).
+    kind = sniff_kind(path)
+    if kind is None:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in IMAGE_EXTS:
+            kind = "image"
+        elif ext in VIDEO_EXTS:
+            kind = "video"
+    if kind == "image":
         return check_image_integrity(path)
-    if ext in VIDEO_EXTS:
+    if kind == "video":
         return check_video_integrity(path, ffmpeg)
     return INTEGRITY_SKIP  # documents, archives, etc. - nothing to decode
 
