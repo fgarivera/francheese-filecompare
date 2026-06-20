@@ -1,0 +1,14 @@
+# PyInstaller build artifacts (regenerated on each build)
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# Claude Code local settings
+.claude/
+
+# Generated reports
+folder_compare_report*.csv
