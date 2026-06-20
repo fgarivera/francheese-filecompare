@@ -121,6 +121,85 @@ def sniff_kind(path):
         return "video"  # an ISO-media file that isn't HEIF is almost certainly video
     return None
 
+
+def suggested_extension(path):
+    """The correct file extension based on the file's actual content."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+    except OSError:
+        return None
+    if len(head) < 12:
+        return None
+    if head[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if head[:4] == b"GIF8":
+        return ".gif"
+    if head[:2] == b"BM":
+        return ".bmp"
+    if head[:4] in (b"II*\x00", b"MM\x00*"):
+        return ".tif"
+    if head[:4] == b"RIFF":
+        if head[8:12] == b"WEBP":
+            return ".webp"
+        if head[8:12] == b"AVI ":
+            return ".avi"
+        return None
+    if head[4:8] == b"ftyp":
+        if head[8:12] in _HEIF_BRANDS or any(b in head for b in _HEIF_BRANDS):
+            return ".heic"
+        if head[8:12] == b"qt  ":
+            return ".mov"
+        return ".mp4"  # other ISO-media video
+    return None
+
+
+def fixable_target(path):
+    """If the file's real category (image vs video) doesn't match its
+    extension - e.g. a video named .HEIC - return the correct extension;
+    otherwise None. Correctly-named files are never 'fixable'."""
+    kind = sniff_kind(path)
+    if kind is None:
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    ext_cat = "image" if ext in IMAGE_EXTS else ("video" if ext in VIDEO_EXTS else None)
+    if ext_cat is None or ext_cat == kind:
+        return None  # not a media extension, or already correct
+    return suggested_extension(path)
+
+
+def fix_mislabeled_files(items, out_dir, stop_event, emit):
+    """Copy each mislabeled file into out_dir with the correct extension, then
+    verify the copy opens. STRICTLY SAFE: reads each original and writes a NEW
+    file only - it never modifies, renames, or deletes the originals."""
+    ff = ffmpeg_path()
+    emit(("integrity_start", len(items)))
+    ok = 0
+    failed = []
+    for i, (src, ext) in enumerate(items, 1):
+        if stop_event.is_set():
+            break
+        emit(("status", f"Fixing: {os.path.basename(src)}"))
+        try:
+            stem = os.path.splitext(os.path.basename(src))[0]
+            dest = os.path.join(out_dir, stem + ext)
+            n = 1
+            while os.path.exists(dest):  # never overwrite anything in the output folder
+                dest = os.path.join(out_dir, f"{stem}_{n}{ext}")
+                n += 1
+            shutil.copy2(src, dest)               # read original, write new copy only
+            result = check_integrity(dest, ff)    # confirm the copy actually opens
+            if result == INTEGRITY_OK:
+                ok += 1
+            else:
+                failed.append((src, f"copy still not openable ({result})"))
+        except Exception as exc:
+            failed.append((src, str(exc)))
+        emit(("integrity_progress", i))
+    emit(("fix_complete", (ok, failed, out_dir)))
+
 INTEGRITY_OK = "OK"
 INTEGRITY_CORRUPT = "CORRUPT"
 INTEGRITY_SKIP = "-"                 # not a photo/video, or format we can't assess
@@ -443,6 +522,7 @@ class FolderCompareApp:
         self.stop_event = threading.Event()
         self.rows_by_rel = {}  # rel -> treeview item id
         self.results = []       # list of row dicts (for export)
+        self.fixable = []       # [(path, correct_ext)] mislabeled files we can fix
         self.mode = "compare"  # "compare" (two folders) or "health" (one folder)
         self.running = False
         self._run_start = 0.0
@@ -490,6 +570,8 @@ class FolderCompareApp:
         self.compare_btn.pack(side="left")
         self.health_btn = ttk.Button(btns, text="Health Check (Left folder only)", command=self._start_health)
         self.health_btn.pack(side="left", padx=4)
+        self.fix_btn = ttk.Button(btns, text="Fix mislabeled files...", command=self._fix_mislabeled, state="disabled")
+        self.fix_btn.pack(side="left", padx=4)
         self.cancel_btn = ttk.Button(btns, text="Cancel", command=self._cancel, state="disabled")
         self.cancel_btn.pack(side="left", padx=4)
         self.export_btn = ttk.Button(btns, text="Export report (CSV)...", command=self._export, state="disabled")
@@ -574,8 +656,10 @@ class FolderCompareApp:
         self._run_start = time.time()
         self._phase_total = None
         self._phase_done = 0
+        self.fixable = []
         self.compare_btn.configure(state="disabled")
         self.health_btn.configure(state="disabled")
+        self.fix_btn.configure(state="disabled")
         self.export_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
 
@@ -636,6 +720,68 @@ class FolderCompareApp:
             daemon=True,
         )
         self.worker.start()
+
+    def _fix_mislabeled(self):
+        if not self.fixable:
+            return
+        n = len(self.fixable)
+        examples = ", ".join(os.path.basename(p) for p, _ in self.fixable[:3])
+        if not messagebox.askokcancel(
+            "Fix mislabeled files",
+            f"Found {n} file(s) whose name doesn't match their actual content "
+            f"(e.g. videos named .HEIC) - that's why they won't open.\n\n"
+            f"Examples: {examples}\n\n"
+            "I'll COPY each into a folder you choose, giving the copy the correct "
+            "extension so it opens properly, then verify each copy opens.\n\n"
+            "Your ORIGINAL files are NOT changed, renamed, or deleted in any way.\n\n"
+            "Continue?"):
+            return
+        out_dir = filedialog.askdirectory(title="Choose a folder for the fixed, openable copies")
+        if not out_dir:
+            return
+
+        # Busy state - but keep the existing results visible on screen
+        self.compare_btn.configure(state="disabled")
+        self.health_btn.configure(state="disabled")
+        self.fix_btn.configure(state="disabled")
+        self.export_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.progress.configure(mode="indeterminate", value=0)
+        self.progress.start(12)
+        self.stop_event.clear()
+        self.running = True
+        self._run_start = time.time()
+        self._phase_total = None
+        self.status_var.set("Making fixed copies...")
+        self.worker = threading.Thread(
+            target=fix_mislabeled_files,
+            args=(list(self.fixable), out_dir, self.stop_event, self.queue.put),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def _finish_fix(self, payload):
+        ok, failed, out_dir = payload
+        self.running = False
+        self.progress.stop()
+        self.progress.configure(mode="determinate", value=self.progress["maximum"])
+        self.compare_btn.configure(state="normal")
+        self.health_btn.configure(state="normal")
+        self.fix_btn.configure(state="normal" if self.fixable else "disabled")
+        self.cancel_btn.configure(state="disabled")
+        if self.results:
+            self.export_btn.configure(state="normal")
+
+        msg = (f"Fixed {ok} file(s).\n\nOpenable copies saved to:\n{out_dir}\n\n"
+               "Your original files were NOT changed.")
+        if failed:
+            msg += f"\n\n{len(failed)} could not be fixed:\n" + "\n".join(
+                f"  - {os.path.basename(s)}: {r}" for s, r in failed[:8])
+            if len(failed) > 8:
+                msg += f"\n  ...and {len(failed) - 8} more"
+        messagebox.showinfo("Fix complete", msg)
+        self.status_var.set(f"Fixed {ok} file(s) into {out_dir}. Originals untouched.")
+        self.eta_var.set(f"Fix complete - {ok} fixed, {len(failed)} skipped.")
 
     def _cancel(self):
         self.stop_event.set()
@@ -702,6 +848,8 @@ class FolderCompareApp:
             self._phase_done = payload
         elif kind == "done":
             self._finish(payload)
+        elif kind == "fix_complete":
+            self._finish_fix(payload)
 
     def _tag_for(self, status):
         if status == STATUS_IDENTICAL:
@@ -771,10 +919,29 @@ class FolderCompareApp:
         else:
             self._finish_compare(outcome)
 
+        # Find mislabeled files (e.g. a video named .HEIC) that we can offer to fix.
+        self.fixable = []
+        for r in self.results:
+            p = r.get("left_full") or r.get("right_full")
+            if not p:
+                continue
+            tgt = fixable_target(p)
+            if tgt:
+                self.fixable.append((p, tgt))
+        self.fix_btn.configure(state="normal" if self.fixable else "disabled")
+        if self.fixable:
+            self.status_var.set(
+                f"Note: {len(self.fixable)} file(s) are mislabeled (wrong extension) - "
+                f"click 'Fix mislabeled files...' to make safe, openable copies.")
+
         elapsed = fmt_duration(time.time() - self._run_start)
         self.eta_var.set(f"Completed in {elapsed}  ({len(self.results):,} files)" if outcome == "complete"
                          else f"Stopped after {elapsed}  ({len(self.results):,} files so far)")
-        self.status_var.set("Done." if outcome == "complete" else "Stopped.")
+        if outcome != "complete":
+            self.status_var.set("Stopped.")
+        elif not self.fixable:
+            self.status_var.set("Done.")
+        # else: keep the 'mislabeled files' hint set above
 
     def _finish_compare(self, outcome):
         counts = {}
