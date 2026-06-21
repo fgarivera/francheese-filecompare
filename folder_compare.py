@@ -869,19 +869,38 @@ class FolderCompareApp:
                 self.status_var.set(f"Skipped - already checked on {when} ({summ}).")
                 return
         else:
-            proceed = messagebox.askokcancel(
-                "Health Check - what it does",
-                "Health Check will OPEN and read every photo and video in:\n\n"
-                f"{folder}\n\n"
-                "It decodes each file to confirm it is not corrupted - exactly like "
-                "opening it to view. It is strictly READ-ONLY:\n\n"
-                "  • It does NOT modify, move, rename, or delete anything.\n"
-                "  • It only reads your files - they cannot be harmed.\n\n"
-                "Large folders and videos can take a while. You can press Cancel at "
-                "any time; partial results stay on screen.\n\n"
-                "Proceed?",
-                icon="info",
-            )
+            children, parents = self._overlapping_checks(folder)
+            if children or parents:
+                lines = []
+                if children:
+                    ex = "; ".join(f"{os.path.basename(p.rstrip(os.sep)) or p} ({t})" for p, t in children[:3])
+                    more = f" and {len(children) - 3} more" if len(children) > 3 else ""
+                    lines.append(f"   • You previously checked {len(children)} subfolder(s) inside this, e.g. {ex}{more}.")
+                if parents:
+                    ex = "; ".join(f"{p} ({t})" for p, t in parents[:2])
+                    lines.append(f"   • This folder was already covered by a check of a parent folder: {ex}.")
+                proceed = messagebox.askokcancel(
+                    "Overlaps a previous check",
+                    "Heads up - this overlaps with checks you've done before:\n\n"
+                    + "\n".join(lines) +
+                    "\n\nThis check will still scan EVERYTHING here (re-covering the overlap, "
+                    "so nothing is missed). It is read-only and never changes your files.\n\nProceed?",
+                    icon="info",
+                )
+            else:
+                proceed = messagebox.askokcancel(
+                    "Health Check - what it does",
+                    "Health Check will OPEN and read every photo and video in:\n\n"
+                    f"{folder}\n\n"
+                    "It decodes each file to confirm it is not corrupted - exactly like "
+                    "opening it to view. It is strictly READ-ONLY:\n\n"
+                    "  • It does NOT modify, move, rename, or delete anything.\n"
+                    "  • It only reads your files - they cannot be harmed.\n\n"
+                    "Large folders and videos can take a while. You can press Cancel at "
+                    "any time; partial results stay on screen.\n\n"
+                    "Proceed?",
+                    icon="info",
+                )
             if not proceed:
                 return
 
@@ -1017,6 +1036,29 @@ class FolderCompareApp:
                 if f and os.path.normcase(os.path.abspath(f)) == key:
                     return rec
         return None
+
+    def _overlapping_checks(self, folder):
+        """Find prior checks that overlap this folder: subfolders inside it
+        ('children') or a parent folder that contained it ('parents')."""
+        key = os.path.normcase(os.path.abspath(folder))
+        children, parents, seen = [], [], set()
+        for rec in reversed(load_history()):
+            if rec.get("action") != "check":
+                continue
+            when = rec.get("timestamp", "?")
+            for f in rec.get("folders", []):
+                if not f:
+                    continue
+                fk = os.path.normcase(os.path.abspath(f))
+                if fk == key or fk in seen:
+                    continue
+                if fk.startswith(key + os.sep):
+                    seen.add(fk)
+                    children.append((f, when))
+                elif key.startswith(fk + os.sep):
+                    seen.add(fk)
+                    parents.append((f, when))
+        return children, parents
 
     def _log_run(self):
         mis = [{"rel": r["rel"], "path": r.get("left_full") or r.get("right_full"), "fix_ext": r.get("fix_ext", "")}
